@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Medication Taper Schedule</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#0f172a; color:#e5e7eb; margin:0; padding:20px; }
+  h1, h2 { font-size:1.4rem; margin:0 0 10px; }
+  label { display:block; margin-top:10px; }
+  input, select, button { padding:8px; margin-top:4px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .card { background:#111827; padding:16px; border-radius:10px; margin-bottom:20px; border:1px solid #1f2937; }
+  .output { white-space:pre-line; background:#0b1220; padding:16px; border-radius:10px; border:1px solid #1f2937; }
+  .output div { margin-bottom:14px; }
+  .note { font-size:.9rem; color:#94a3b8; margin-top:10px; }
+  .dose-section { margin-top:15px; padding:12px; border:1px solid #1f2937; border-radius:8px; background:#0d1426; }
+  .grid { display:grid; gap:10px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .grid-3 { display:grid; gap:10px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  @media (max-width: 900px) { .grid, .grid-3 { grid-template-columns: 1fr; } }
+  .muted { color:#94a3b8; font-size:.9rem; }
+</style>
+</head>
+<body>
+  <h1>Medication Taper Schedule</h1>
+
+  <div class="card">
+    <div class="grid-3">
+      <label>Medication name
+        <input id="medName" type="text" value="Prednisolone" />
+      </label>
+      <label>Dosage form
+        <select id="dosageForm">
+          <option value="tablet">Tablets</option>
+          <option value="capsule">Capsules</option>
+        </select>
+      </label>
+      <label>Available strengths (mg, comma-separated)
+        <input id="strengths" type="text" value="5,1" />
+      </label>
+    </div>
+
+    <div class="grid-3">
+      <label>Interval length (days)
+        <input id="intervalDays" type="number" min="1" step="1" value="7" />
+      </label>
+      <label>Number of dosing times per day
+        <input id="numTimes" type="number" min="1" max="8" value="1" />
+      </label>
+      <div style="align-self:end">
+        <button id="setupTimes">Set up times</button>
+      </div>
+    </div>
+
+    <div id="timesContainer"></div>
+
+    <div class="grid-3" style="margin-top:12px">
+      <label>Default mode for new times
+        <select id="globalDirection">
+          <option value="down" selected>Reduce</option>
+          <option value="up">Increase</option>
+          <option value="hold">Hold constant</option>
+        </select>
+      </label>
+      <label>Default step (mg per interval)
+        <input id="globalStep" type="number" step="0.5" value="5" />
+      </label>
+      <div class="muted" style="align-self:end">Each time can override mode & step.</div>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <button id="buildBtn">Build schedule</button>
+      <button id="exportPDF">Export PDF</button>
+      <button id="exportWord">Export Word</button>
+      <span id="msg" class="muted"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Schedule</h2>
+    <div id="output" class="output">Choose “Set up times”, enter doses, then Build.</div>
+    <div id="warnings" class="note"></div>
+    <div class="note">Experimental</div>
+    <div class="note">Current bugs :</div>
+    <div class="note">when multiple drugs are being tapered and the final drug is about to reach its target dose (being non 0) it stops one interval before it reaches the target just increase / decrease the target dose accordingly.</div>
+    <div class="note">the export word feature is bugging out at the moment as the api that I am using wants email veryfication each time :/ </div>
+  </div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/docx/8.0.1/docx.min.js"></script>
+<script>
+/* ===== Utilities ===== */
+function numberToWordsUpper(n) {
+  n = Math.floor(Math.abs(n));
+  const LT20 = ["ZERO","ONE","TWO","THREE","FOUR","FIVE","SIX","SEVEN","EIGHT","NINE","TEN",
+                "ELEVEN","TWELVE","THIRTEEN","FOURTEEN","FIFTEEN","SIXTEEN","SEVENTEEN","EIGHTEEN","NINETEEN"];
+  const TENS = ["","","TWENTY","THIRTY","FORTY","FIFTY","SIXTY","SEVENTY","EIGHTY","NINETY"];
+  if (n < 20) return LT20[n];
+  if (n < 100) { const ten=Math.floor(n/10), unit=n%10; return TENS[ten]+(unit?("-"+LT20[unit]):""); }
+  if (n < 1000) { const hund=Math.floor(n/100), rest=n%100; return LT20[hund]+" HUNDRED"+(rest?(" "+numberToWordsUpper(rest)):""); }
+  if (n < 1000000) { const thou=Math.floor(n/1000), rest=n%1000; return numberToWordsUpper(thou)+" THOUSAND"+(rest?(" "+numberToWordsUpper(rest)):""); }
+  return n.toString();
+}
+const defaults = ["Morning","Afternoon","Evening","Bedtime","Late night","Noon","Pre-dinner","Post-dinner"];
+const plural = (n, word) => n===1 ? word : (word+"s");
+function formatMg(x) { return (Math.round(x) === x) ? String(Math.round(x)) : String(x); }
+
+/* ===== Dynamic form for times ===== */
+function makeTimeSection(i, dirDefault, stepDefault) {
+  const section = document.createElement("div");
+  section.className = "dose-section";
+  section.innerHTML = `
+    <div class="grid">
+      <label>Time label
+        <input type="text" id="label_${i}" value="${defaults[i] || 'Time '+(i+1)}" />
+      </label>
+      <label>Start dose (mg)
+        <input type="number" step="0.5" id="start_${i}" value="5" />
+      </label>
+      <label>Target dose (mg)
+        <input type="number" step="0.5" id="target_${i}" value="0" />
+      </label>
+      <label>Mode
+        <select id="mode_${i}">
+          <option value="down"${dirDefault==='down'?' selected':''}>Reduce</option>
+          <option value="up"${dirDefault==='up'?' selected':''}>Increase</option>
+          <option value="hold"${dirDefault==='hold'?' selected':''}>Hold constant</option>
+        </select>
+      </label>
+      <label>Step (mg per interval)
+        <input type="number" step="0.5" id="step_${i}" value="${stepDefault}" />
+      </label>
+    </div>
+  `;
+  setTimeout(()=>toggleStepEnable(i),0);
+  section.querySelector(`#mode_${i}`).addEventListener('change', ()=>toggleStepEnable(i));
+  return section;
+}
+function toggleStepEnable(i) {
+  const mode = document.getElementById(`mode_${i}`).value;
+  const step = document.getElementById(`step_${i}`);
+  step.disabled = (mode === 'hold');
+}
+document.getElementById('setupTimes').addEventListener('click', () => {
+  const n = Math.min(Math.max(parseInt(document.getElementById('numTimes').value||1,10),1),8);
+  const dirDefault = document.getElementById('globalDirection').value;
+  const stepDefault = parseFloat(document.getElementById('globalStep').value)||0.5;
+  const container = document.getElementById('timesContainer');
+  container.innerHTML = "";
+  for (let i=0;i<n;i++) container.appendChild(makeTimeSection(i, dirDefault, stepDefault));
+  document.getElementById('msg').textContent = `Created ${n} time section${n>1?'s':''}.`;
+});
+
+/* ===== Multi-strength optimizer (min pills, prefer larger strengths) ===== */
+function parseStrengths() {
+  const raw = (document.getElementById('strengths').value || "").split(",");
+  const arr = raw.map(s => parseFloat(s.trim())).filter(v => v>0 && Number.isFinite(v));
+  // unique & sorted DESC
+  return Array.from(new Set(arr)).sort((a,b) => b - a);
+}
+function maxDecimals(nums) {
+  return nums.reduce((m,x)=>{
+    const s = String(x);
+    const p = s.indexOf('.');
+    return Math.max(m, p>=0 ? (s.length - p - 1) : 0);
+  },0);
+}
+/* Returns {parts:[{count, mg}], totalMg} where mg is in real mg units */
+function bestComboForDose(doseMg, strengthsMg) {
+  if (doseMg <= 0 || !strengthsMg.length) return { parts: [], totalMg: 0 };
+  const dec = maxDecimals([doseMg, ...strengthsMg]);
+  const scale = Math.pow(10, dec);
+  const dose = Math.round(doseMg * scale);
+  const denoms = strengthsMg.map(s => Math.round(s * scale)).sort((a,b)=>b-a);
+
+  // DP for min pills up to a reasonable limit around dose
+  const maxDen = denoms[0];
+  const LIMIT = dose + maxDen * 100; // generous buffer to find a nearby achievable sum
+  const INF = 1e9;
+  const dp = new Array(LIMIT+1).fill(INF);
+  const prev = new Array(LIMIT+1).fill(-1);
+  const coinUsed = new Array(LIMIT+1).fill(-1);
+  dp[0] = 0;
+
+  for (let s = 1; s <= LIMIT; s++) {
+    for (let i = 0; i < denoms.length; i++) {
+      const c = denoms[i];
+      if (s >= c && dp[s - c] + 1 < dp[s]) {
+        dp[s] = dp[s - c] + 1;
+        prev[s] = s - c;
+        coinUsed[s] = i;
+      }
+    }
+  }
+
+  function reconstruct(s) {
+    const counts = new Array(denoms.length).fill(0);
+    while (s > 0 && coinUsed[s] !== -1) {
+      const i = coinUsed[s];
+      counts[i]++; s = prev[s];
+    }
+    return counts;
+  }
+  function candidateAt(sum) {
+    const counts = reconstruct(sum);
+    const pills = counts.reduce((a,b)=>a+b,0);
+    return { sum, counts, pills };
+  }
+  function better(a, b) {
+    // prefer closer to target, then fewer pills, then more larger units
+    const da = Math.abs(a.sum - dose), db = Math.abs(b.sum - dose);
+    if (da !== db) return da < db;
+    if (a.pills !== b.pills) return a.pills < b.pills;
+    for (let i=0;i<denoms.length;i++) {
+      if (a.counts[i] !== b.counts[i]) return a.counts[i] > b.counts[i]; // prefer more big tabs
+    }
+    return false;
+  }
+
+  let best = null;
+  for (let d = 0; d <= LIMIT; d++) {
+    const s1 = dose - d;
+    const s2 = dose + d;
+    if (s1 >= 0 && dp[s1] < INF) {
+      const cand = candidateAt(s1);
+      best = !best || better(cand, best) ? cand : best;
+    }
+    if (s2 <= LIMIT && dp[s2] < INF) {
+      const cand = candidateAt(s2);
+      best = !best || better(cand, best) ? cand : best;
+    }
+    if (best && Math.abs(best.sum - dose) === d) break; // found a closest sum (continue only if tie-breaking needed)
+  }
+  if (!best) return { parts: [], totalMg: 0 };
+
+  // Build parts from counts (denoms are DESC)
+  const parts = [];
+  for (let i=0;i<denoms.length;i++) {
+    const cnt = best.counts[i];
+    if (cnt > 0) {
+      const mg = denoms[i] / scale;
+      parts.push({ count: cnt, mg });
+    }
+  }
+  const totalMg = best.sum / scale;
+  return { parts, totalMg };
+}
+function formatComboText(combo, formWord) {
+  if (!combo.parts.length) return null;
+  const pieces = combo.parts.map(p => {
+    return `${numberToWordsUpper(p.count)} ${formatMg(p.mg)}mg ${plural(p.count, formWord)}`;
+  });
+  return pieces.join(" and ");
+}
+
+/* ===== Build schedule ===== */
+function buildSchedule() {
+  const medName = document.getElementById('medName').value || "Medication";
+  const formWord = document.getElementById('dosageForm').value; // "tablet" or "capsule"
+  const strengths = parseStrengths();
+  const intervalDays = Math.max(1, parseInt(document.getElementById('intervalDays').value||7,10));
+
+  if (!strengths.length) {
+    document.getElementById('output').textContent = "Please enter at least one valid strength (e.g., 5,1).";
+    return [];
+  }
+
+  const n = Math.min(Math.max(parseInt(document.getElementById('numTimes').value||1,10),1),8);
+  let times = [];
+  let warnings = [];
+  for (let i=0;i<n;i++) {
+    const label = (document.getElementById(`label_${i}`)?.value || `Time ${i+1}`).trim();
+    const start = parseFloat(document.getElementById(`start_${i}`)?.value);
+    let target = parseFloat(document.getElementById(`target_${i}`)?.value);
+    const mode = document.getElementById(`mode_${i}`)?.value || 'down';
+    const step = parseFloat(document.getElementById(`step_${i}`)?.value) || 0;
+
+    if ([start,target].some(x=>Number.isNaN(x)) || (mode!=='hold' && (step<=0 || !Number.isFinite(step)))) {
+      document.getElementById('output').textContent = "Please enter valid numbers for all sections.";
+      return [];
+    }
+    if (mode==='hold' && target !== start) {
+      warnings.push(`Adjusted target for "${label}" to ${start} mg because mode is HOLD.`);
+      target = start;
+    }
+    times.push({ label, start, target, mode, step });
+  }
+
+  const out = document.getElementById('output');
+  out.innerHTML = "";
+  const warnBox = document.getElementById('warnings');
+  warnBox.textContent = warnings.join(" ");
+
+  const labelForCycle = (cycle, dayStart) => {
+    if (intervalDays === 7) return `Week ${cycle}:`;
+    const dayEnd = dayStart + intervalDays - 1;
+    return `Day ${dayStart} to Day ${dayEnd}:`;
+  };
+
+  // State
+  let current = times.map(t=>t.start);
+  let done = () => times.every((t,i) => {
+    if (t.mode==='down') return current[i] <= t.target;
+    if (t.mode==='up') return current[i] >= t.target;
+    return true; // hold
+  });
+
+  let lines = [];
+  let cycle = 1;
+  let dayStart = 1;
+  const GUARD_MAX = 500;
+
+  while (!done() && cycle <= GUARD_MAX) {
+    const label = labelForCycle(cycle, dayStart);
+    dayStart += (intervalDays === 7 ? 7 : intervalDays);
+
+    const parts = times.map((t,i) => {
+      const dose = Math.max(0, current[i]);
+      if (dose <= 0) return null;
+      const combo = bestComboForDose(dose, strengths);
+      const comboText = formatComboText(combo, formWord);
+      if (!comboText) return null;
+      return `Take ${comboText} (${formatMg(combo.totalMg)}mg) of ${medName} every ${t.label.toUpperCase()}`;
+    }).filter(Boolean);
+
+    lines.push(parts.length ? `${label} ${parts.join(" and ")}` : `${label} No dose scheduled.`);
+
+    // step independently
+    current = current.map((val,i) => {
+      const t = times[i];
+      if (t.mode==='down' && val > t.target) return Math.max(t.target, val - t.step);
+      if (t.mode==='up' && val < t.target) return Math.min(t.target, val + t.step);
+      return val; // hold or at target
+    });
+
+    cycle++;
+  }
+
+  // If everything tapered to 0, add final STOP line
+  const allZeroTargets = times.every(t => t.target <= 0);
+  const hadAnyDose = times.some(t => t.start > 0);
+  if (allZeroTargets && hadAnyDose) {
+    const label = labelForCycle(cycle, dayStart);
+    lines.push(`${label} STOP ${medName}`);
+  }
+
+  // Render
+  lines.forEach(line => {
+    const div = document.createElement('div');
+    div.textContent = line;
+    out.appendChild(div);
+  });
+
+  document.getElementById('msg').textContent = `Built ${lines.length} interval${lines.length!==1?'s':''}.`;
+  return lines;
+}
+document.getElementById('buildBtn').addEventListener('click', buildSchedule);
+
+/* ===== Export ===== */
+document.getElementById('exportPDF').addEventListener('click', () => {
+  const lines = buildSchedule();
+  if (!lines.length) return;
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  doc.setFont("helvetica","normal");
+  let y = 20, pageH = doc.internal.pageSize.getHeight();
+  lines.forEach(line => {
+    const split = doc.splitTextToSize(line, 180);
+    split.forEach(chunk => {
+      if (y > pageH - 15) { doc.addPage(); y = 20; }
+      doc.text(chunk, 10, y); y += 8;
+    });
+    y += 4;
+  });
+  doc.save("schedule.pdf");
+});
+document.getElementById('exportWord').addEventListener('click', () => {
+  const lines = buildSchedule();
+  if (!lines.length) return;
+  const { Document, Packer, Paragraph } = window.docx;
+  const doc = new Document({
+    sections: [{ properties: {}, children: lines.map(l => new Paragraph(l)) }]
+  });
+  Packer.toBlob(doc).then(blob => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "schedule.docx";
+    a.click();
+  });
+});
+</script>
+</body>
+</html>
+
