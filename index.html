@@ -79,10 +79,10 @@
     <h2>Schedule</h2>
     <div id="output" class="output">Choose “Set up times”, enter doses, then Build.</div>
     <div id="warnings" class="note"></div>
-    <div class="note">Experimental</div>
+
+    <div class="note"></div>
     <div class="note">Current bugs :</div>
-    <div class="note">when multiple drugs are being tapered and the final drug is about to reach its target dose (being non 0) it stops one interval before it reaches the target just increase / decrease the target dose accordingly.</div>
-    <div class="note">the export word feature is bugging out at the moment as the api that I am using wants email veryfication each time :/ </div>
+
   </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -284,7 +284,6 @@ function buildSchedule() {
     }
     times.push({ label, start, target, mode, step });
   }
-
   const out = document.getElementById('output');
   out.innerHTML = "";
   const warnBox = document.getElementById('warnings');
@@ -318,8 +317,8 @@ function buildSchedule() {
       if (dose <= 0) return null;
       const combo = bestComboForDose(dose, strengths);
       const comboText = formatComboText(combo, formWord);
-      if (!comboText) return null;
-      return `Take ${comboText} (${formatMg(combo.totalMg)}mg) of ${medName} every ${t.label.toUpperCase()}`;
+      if (!comboText) return null; 
+      return `Take ${comboText} (${formatMg(combo.totalMg)}mg) every ${t.label.toUpperCase()}`;
     }).filter(Boolean);
 
     lines.push(parts.length ? `${label} ${parts.join(" and ")}` : `${label} No dose scheduled.`);
@@ -352,8 +351,11 @@ function buildSchedule() {
 
   document.getElementById('msg').textContent = `Built ${lines.length} interval${lines.length!==1?'s':''}.`;
   return lines;
+  
 }
 document.getElementById('buildBtn').addEventListener('click', buildSchedule);
+
+
 
 /* ===== Export ===== */
 document.getElementById('exportPDF').addEventListener('click', () => {
@@ -387,6 +389,133 @@ document.getElementById('exportWord').addEventListener('click', () => {
     a.click();
   });
 });
+
+function buildSchedule() {
+  const medName = document.getElementById('medName').value || "Medication";
+  const formWord = document.getElementById('dosageForm').value; // "tablet" or "capsule"
+  const strengths = parseStrengths();
+  const intervalDays = Math.max(1, parseInt(document.getElementById('intervalDays').value||7,10));
+
+  if (!strengths.length) {
+    document.getElementById('output').textContent = "Please enter at least one valid strength (e.g., 5,1).";
+    return [];
+  }
+
+  const n = Math.min(Math.max(parseInt(document.getElementById('numTimes').value||1,10),1),8);
+  let times = [];
+  let warnings = [];
+  for (let i=0;i<n;i++) {
+    const label = (document.getElementById(`label_${i}`)?.value || `Time ${i+1}`).trim();
+    const start = parseFloat(document.getElementById(`start_${i}`)?.value);
+    let target = parseFloat(document.getElementById(`target_${i}`)?.value);
+    const mode = document.getElementById(`mode_${i}`)?.value || 'down';
+    const step = parseFloat(document.getElementById(`step_${i}`)?.value) || 0;
+
+    if ([start,target].some(x=>Number.isNaN(x)) || (mode!=='hold' && (step<=0 || !Number.isFinite(step)))) {
+      document.getElementById('output').textContent = "Please enter valid numbers for all sections.";
+      return [];
+    }
+    if (mode==='hold' && target !== start) {
+      warnings.push(`Adjusted target for "${label}" to ${start} mg because mode is HOLD.`);
+      target = start;
+    }
+    times.push({ label, start, target, mode, step });
+  }
+  const out = document.getElementById('output');
+  out.innerHTML = "";
+  const warnBox = document.getElementById('warnings');
+  warnBox.textContent = warnings.join(" ");
+
+  const labelForCycle = (cycle, dayStart) => {
+    if (intervalDays === 7) return `Week ${cycle}:`;
+    const dayEnd = dayStart + intervalDays - 1;
+    return `Day ${dayStart} to Day ${dayEnd}:`;
+  };
+
+  // State
+  let current = times.map(t=>t.start);
+  let done = () => times.every((t,i) => {
+    if (t.mode==='down') return current[i] <= t.target;
+    if (t.mode==='up') return current[i] >= t.target;
+    return true; // hold
+  });
+
+  let lines = [];
+  let cycle = 1;
+  let dayStart = 1;
+  const GUARD_MAX = 500;
+
+  // New: tracker for total tablets
+  let totals = {}; // { strengthMg : count }
+
+  while (!done() && cycle <= GUARD_MAX) {
+    const label = labelForCycle(cycle, dayStart);
+    dayStart += (intervalDays === 7 ? 7 : intervalDays);
+
+    const parts = times.map((t,i) => {
+      const dose = Math.max(0, current[i]);
+      if (dose <= 0) return null;
+      const combo = bestComboForDose(dose, strengths);
+
+      // accumulate totals
+      combo.parts.forEach(p => {
+        totals[p.mg] = (totals[p.mg] || 0) + p.count * intervalDays;
+      });
+
+      const comboText = formatComboText(combo, formWord);
+      if (!comboText) return null; 
+      return `Take ${comboText} (${formatMg(combo.totalMg)}mg) every ${t.label.toUpperCase()}`;
+    }).filter(Boolean);
+
+    lines.push(parts.length ? `${label} ${parts.join(" and ")}` : `${label} No dose scheduled.`);
+
+    // step independently
+    current = current.map((val,i) => {
+      const t = times[i];
+      if (t.mode==='down' && val > t.target) return Math.max(t.target, val - t.step);
+      if (t.mode==='up' && val < t.target) return Math.min(t.target, val + t.step);
+      return val; // hold or at target
+    });
+
+    cycle++;
+  }
+
+  const allZeroTargets = times.every(t => t.target <= 0);
+  const hadAnyDose = times.some(t => t.start > 0);
+  if (allZeroTargets && hadAnyDose) {
+    const label = labelForCycle(cycle, dayStart);
+    lines.push(`${label} STOP ${medName}`);
+  }
+
+  // Render schedule
+  lines.forEach(line => {
+    const div = document.createElement('div');
+    div.textContent = line;
+    out.appendChild(div);
+  });
+
+  // Render totals at bottom
+  if (Object.keys(totals).length) {
+    const div = document.createElement('div');
+    div.style.marginTop = "12px";
+    div.style.fontWeight = "bold";
+    div.textContent = "Total tablets needed:";
+    out.appendChild(div);
+
+    Object.keys(totals).sort((a,b)=>parseFloat(b)-parseFloat(a)).forEach(strength => {
+      const d = document.createElement('div');
+      d.textContent = `${totals[strength]} x ${strength}mg ${plural(totals[strength], formWord)}`;
+      out.appendChild(d);
+    });
+  }
+
+  document.getElementById('msg').textContent = `Built ${lines.length} interval${lines.length!==1?'s':''}.`;
+  return lines;
+}
+
+
 </script>
 </body>
 </html>
+
+
